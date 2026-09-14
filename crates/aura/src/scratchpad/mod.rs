@@ -11,7 +11,10 @@
 //! 4. **ScratchpadStorage** — file I/O with path validation. Files persist
 //!    alongside orchestration artifacts under `{memory_dir}/.../scratchpad/`
 //!    for post-hoc debugging; explicit cleanup is exposed but not auto-called.
+//! 5. **ArgReferenceTool** — lets configured tool arguments name a stored
+//!    file (`<field>_file`) instead of carrying its content inline.
 
+pub mod arg_reference;
 pub mod context_budget;
 pub mod schema;
 pub mod setup;
@@ -19,6 +22,7 @@ pub mod storage;
 pub mod tools;
 pub mod wrapper;
 
+pub use arg_reference::{ArgReferenceTool, FieldPath, ReferenceResolver, by_reference_map};
 pub use context_budget::{
     ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,
     token_counter_for_provider,
@@ -122,13 +126,14 @@ pub fn scratchpad_tool_map(
 }
 
 /// True when at least one tool reachable through `mcp_filter` (`None` =
-/// all reachable, empty `Some` = none) is keyed in the resolved scratchpad
-/// map — i.e. there's something for the wrapper to intercept. An exact
-/// lookup: `scratchpad_tool_map` is keyed by tool name, not pattern.
-pub fn has_accessible_scratchpad_tool(
+/// all reachable, empty `Some` = none) is keyed in a resolved scratchpad
+/// map ([`scratchpad_tool_map`] or [`by_reference_map`]) — i.e. there's
+/// something for the scratchpad to act on. An exact lookup: both maps are
+/// keyed by tool name, not pattern.
+pub fn has_accessible_scratchpad_tool<V>(
     tool_names: &[String],
     mcp_filter: Option<&[String]>,
-    scratchpad_tool_map: &HashMap<String, usize>,
+    scratchpad_tool_map: &HashMap<String, V>,
 ) -> bool {
     if scratchpad_tool_map.is_empty() {
         return false;
@@ -178,6 +183,8 @@ pub struct ScratchpadToolsConfig {
     /// longest-match-wins, ties broken by smallest threshold) so per-tool-call
     /// interception is an exact `HashMap::get`.
     pub scratchpad_tools: HashMap<String, usize>,
+    /// Map of bare tool name → argument fields that accept a file reference.
+    pub by_reference: HashMap<String, Vec<FieldPath>>,
 }
 
 /// Scratchpad usage instructions appended to worker preambles.
@@ -405,7 +412,7 @@ mod tests {
         assert!(!has_accessible_scratchpad_tool(
             &["foo".to_string()],
             None,
-            &HashMap::new(),
+            &HashMap::<String, usize>::new(),
         ));
     }
 

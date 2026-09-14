@@ -730,6 +730,8 @@ impl Orchestrator {
                 .unwrap_or_default();
             let scratchpad_tool_map =
                 scratchpad::scratchpad_tool_map(self.agent_config.mcp.as_ref(), &tools_per_server);
+            let by_reference_map =
+                scratchpad::by_reference_map(self.agent_config.mcp.as_ref(), &tools_per_server);
             let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
             let accessible_tools = self
                 .mcp_manager
@@ -740,6 +742,10 @@ impl Orchestrator {
                 &accessible_tools,
                 worker_filter,
                 &scratchpad_tool_map,
+            ) || scratchpad::has_accessible_scratchpad_tool(
+                &accessible_tools,
+                worker_filter,
+                &by_reference_map,
             );
 
             if !has_matching_tool {
@@ -751,7 +757,7 @@ impl Orchestrator {
                     );
                 } else {
                     tracing::warn!(
-                        "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
+                        "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold or by_reference entry; skipping",
                         task_id
                     );
                 }
@@ -798,6 +804,7 @@ impl Orchestrator {
                     storage_dir: &iter_dir,
                     read_root: Some(&read_root),
                     scratchpad_tool_map,
+                    by_reference_map,
                     context_window,
                     initial_used,
                     token_counter,

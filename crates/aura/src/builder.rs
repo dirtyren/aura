@@ -186,6 +186,7 @@ impl Agent {
             .unwrap_or_default();
         let scratchpad_tool_map =
             scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
+        let by_reference_map = scratchpad::by_reference_map(config.mcp.as_ref(), &tools_per_server);
         let accessible_tools = mcp_manager
             .map(|mgr| mgr.get_available_tool_names())
             .unwrap_or_default();
@@ -197,9 +198,14 @@ impl Agent {
             &accessible_tools,
             filter,
             &scratchpad_tool_map,
+        ) && !scratchpad::has_accessible_scratchpad_tool(
+            &accessible_tools,
+            filter,
+            &by_reference_map,
         ) {
             tracing::info!(
-                "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping"
+                "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold \
+                 or by_reference entry; skipping"
             );
             return Ok(None);
         }
@@ -246,6 +252,7 @@ impl Agent {
             storage_dir: std::path::Path::new(&memory_dir),
             read_root: None,
             scratchpad_tool_map,
+            by_reference_map,
             context_window,
             initial_used,
             token_counter,
@@ -1141,9 +1148,40 @@ impl Agent {
 
     /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
     ///
-    /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
-    /// created using `config.tool_context_factory` (or a default context).
+    /// A tool with `by_reference` fields is first wrapped in
+    /// [`scratchpad::ArgReferenceTool`], *inside* `config.tool_wrapper`, so the
+    /// wrapper chain (persistence, observer, HITL) sees the references the
+    /// model sent rather than the expanded file contents.
     fn add_mcp_tool<M, T>(
+        builder_state: BuilderState<M>,
+        tool: T,
+        config: &AgentRuntimeConfig,
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+        T: rig::tool::Tool<Args = serde_json::Value, Output = String, Error = rig::tool::ToolError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        if let Some(scratchpad) = &config.scratchpad_tools_config
+            && let Some(fields) = scratchpad.by_reference.get(&tool.name())
+        {
+            let resolver = scratchpad::ReferenceResolver::new(
+                scratchpad.storage.clone(),
+                config.orchestration_persistence.clone(),
+            );
+            let tool = scratchpad::ArgReferenceTool::new(tool, fields.clone(), resolver);
+            return Self::add_wrapped_tool(builder_state, tool, config);
+        }
+        Self::add_wrapped_tool(builder_state, tool, config)
+    }
+
+    /// Add `tool`, wrapped with `config.tool_wrapper` if set, using
+    /// `config.tool_context_factory` (or a default context) for per-call
+    /// context.
+    fn add_wrapped_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
         config: &AgentRuntimeConfig,
