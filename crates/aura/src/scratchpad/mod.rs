@@ -76,7 +76,7 @@ pub fn scratchpad_tool_map(
         let Some(server_cfg) = mcp.servers.get(server_name) else {
             continue;
         };
-        let patterns = server_cfg.scratchpad();
+        let patterns = &server_cfg.scratchpad().tools;
         if patterns.is_empty() {
             continue;
         }
@@ -221,10 +221,13 @@ mod tests {
     use crate::config::{McpConfig, McpServerConfig};
 
     fn server_with_scratchpad(patterns: &[(&str, usize)]) -> McpServerConfig {
-        let scratchpad = patterns
-            .iter()
-            .map(|(p, t)| ((*p).to_string(), ScratchpadToolEntry { min_tokens: *t }))
-            .collect();
+        let scratchpad = aura_config::ServerScratchpadConfig {
+            tools: patterns
+                .iter()
+                .map(|(p, t)| ((*p).to_string(), ScratchpadToolEntry { min_tokens: *t }))
+                .collect(),
+            ..Default::default()
+        };
         McpServerConfig::HttpStreamable {
             url: "http://test".to_string(),
             headers: HashMap::new(),
