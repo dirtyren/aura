@@ -1686,7 +1686,9 @@ impl StreamingAgent for Agent {
         request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
+            mcp_manager
+                .set_current_call(request_id, aura_events::AgentContext::single_agent())
+                .await;
         }
 
         let stream = if chat_history.is_empty() {
@@ -1711,7 +1713,9 @@ impl StreamingAgent for Agent {
     ) {
         // Production entry point — set MCP request ID before delegating
         if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
+            mcp_manager
+                .set_current_call(request_id, aura_events::AgentContext::single_agent())
+                .await;
         }
 
         let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
@@ -2059,7 +2063,7 @@ mod tests {
         /// A manager offering the same tool name on each of the three transports, all backed by `server`, so the tag composition distinguishes them downstream.
         async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
             let connect = async || {
-                McpClient::new(server.url.clone(), &HashMap::new())
+                McpClient::new(server.url.clone(), &HashMap::new(), "test/0")
                     .await
                     .expect("the loopback server completes the handshake")
             };
@@ -2078,6 +2082,7 @@ mod tests {
                     vec![declared_tool("stdio_tool")],
                 )]),
                 sanitize_schemas: false,
+                user_agent: crate::config::McpUserAgent::new("test/0").unwrap(),
             }
         }
 

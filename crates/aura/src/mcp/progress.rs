@@ -21,7 +21,7 @@
 use rmcp::{
     ClientHandler,
     handler::client::progress::ProgressDispatcher,
-    model::ProgressNotificationParam,
+    model::{ClientInfo, Implementation, ProgressNotificationParam},
     service::{NotificationContext, RoleClient},
 };
 use std::sync::Arc;
@@ -29,7 +29,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::request_progress::{self, ProgressNotification};
+use aura_events::Progress;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+
+use crate::mcp::client::CallContext;
 
 /// A custom ClientHandler that routes progress notifications to request-scoped channels.
 ///
@@ -40,44 +43,56 @@ use crate::request_progress::{self, ProgressNotification};
 ///
 /// # Example
 /// ```ignore
-/// // Create handler with shared request ID reference
-/// let current_request_id = Arc::new(RwLock::new(None));
-/// let handler = ProgressEnabledHandler::new(current_request_id.clone());
+/// // Create handler with a shared reference to the in-flight call
+/// let current_call = Arc::new(RwLock::new(None));
+/// let handler = ProgressEnabledHandler::new(current_call.clone(), "aura/0.1.0");
 /// let client = serve_client(handler.clone(), transport).await?;
 ///
-/// // Set request ID before tool execution
-/// *current_request_id.write().await = Some("req_123".to_string());
+/// // Name the call before tool execution
+/// *current_call.write().await = Some(CallContext {
+///     request_id: "req_123".to_string(),
+///     agent: AgentContext::single_agent(),
+/// });
 ///
 /// // Progress notifications will now be routed to req_123's channel
 /// ```
 #[derive(Clone)]
 pub struct ProgressEnabledHandler {
     progress_dispatcher: ProgressDispatcher,
-    /// Shared reference to the current HTTP request ID
-    /// This is set by the MCP client before each tool execution
-    current_request_id: Arc<RwLock<Option<String>>>,
+    /// The call this client is serving, shared with the [`McpClient`] that owns it.
+    current_call: Arc<RwLock<Option<CallContext>>>,
     /// Flag to log orphaned progress only once (prevents log flood from servers ignoring cancellation)
     logged_orphaned_warning: Arc<AtomicBool>,
     /// Counter for orphaned progress notifications (for diagnostics)
     orphaned_count: Arc<AtomicU64>,
+    /// This client's MCP `clientInfo`.
+    client_info: ClientInfo,
 }
 
 impl std::fmt::Debug for ProgressEnabledHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressEnabledHandler")
             .field("progress_dispatcher", &self.progress_dispatcher)
-            .field("current_request_id", &"Arc<RwLock<Option<String>>>")
+            .field("current_call", &"Arc<RwLock<Option<CallContext>>>")
             .finish()
     }
 }
 
 impl ProgressEnabledHandler {
-    pub fn new(current_request_id: Arc<RwLock<Option<String>>>) -> Self {
+    /// `user_agent` is the same `product/version` token sent as the HTTP
+    /// `User-Agent` header; the handshake announces it split into
+    /// `clientInfo.name` and `clientInfo.version`, the shape MCP servers
+    /// expect there.
+    pub fn new(current_call: Arc<RwLock<Option<CallContext>>>, user_agent: &str) -> Self {
         Self {
             progress_dispatcher: ProgressDispatcher::new(),
-            current_request_id,
+            current_call,
             logged_orphaned_warning: Arc::new(AtomicBool::new(false)),
             orphaned_count: Arc::new(AtomicU64::new(0)),
+            client_info: ClientInfo {
+                client_info: implementation_from_user_agent(user_agent),
+                ..ClientInfo::default()
+            },
         }
     }
 
@@ -98,7 +113,32 @@ impl ProgressEnabledHandler {
     }
 }
 
+/// The product page announced as `clientInfo.websiteUrl`, which MCP servers
+/// that track clients link back to.
+const AURA_WEBSITE_URL: &str = "https://www.mezmo.com/aura";
+
+/// Split a `product/version` user-agent token into MCP `clientInfo`. A token
+/// with no version part names the product alone and reports the running crate
+/// version, so a bare deployment tag still carries a real version.
+fn implementation_from_user_agent(user_agent: &str) -> Implementation {
+    let (name, version) = user_agent.split_once('/').unwrap_or((user_agent, ""));
+    let version = match version.trim() {
+        "" => env!("CARGO_PKG_VERSION"),
+        version => version,
+    };
+    Implementation {
+        name: name.trim().to_owned(),
+        version: version.to_owned(),
+        website_url: Some(AURA_WEBSITE_URL.to_owned()),
+        ..Implementation::default()
+    }
+}
+
 impl ClientHandler for ProgressEnabledHandler {
+    fn get_info(&self) -> ClientInfo {
+        self.client_info.clone()
+    }
+
     /// Handle progress notifications from the MCP server
     ///
     /// This method is called when the server sends `notifications/progress` messages.
@@ -116,30 +156,30 @@ impl ClientHandler for ProgressEnabledHandler {
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            // Get current request ID (if any)
-            let request_id = self.current_request_id.read().await.clone();
+            // One read, so the id and the agent describe the same call.
+            let current_call = self.current_call.read().await.clone();
 
-            // Build notification for request-scoped broker
-            let notification = ProgressNotification {
-                progress_token: params.progress_token.clone(),
-                progress: params.progress,
-                total: params.total,
-                message: params.message.clone(),
-            };
-
-            if let Some(ref req_id) = request_id {
-                // Route to request-specific channel
-                let sent = request_progress::publish(req_id, notification).await;
-                if sent {
+            if let Some(CallContext { request_id, agent }) = current_call {
+                let req_id = &request_id;
+                let routed = crate::agent_events::emit(
+                    req_id,
+                    AgentEvent::new(
+                        agent,
+                        AgentEventPayload::ToolProgress {
+                            progress_token: params.progress_token.clone(),
+                            progress: Progress {
+                                current: params.progress,
+                                total: params.total,
+                            },
+                            message: params.message.clone(),
+                        },
+                    ),
+                )
+                .await;
+                if routed == crate::agent_events::Routed::Delivered {
                     debug!(
                         "Progress notification routed to request '{}': progress={}, message={:?}",
                         req_id, params.progress, params.message
-                    );
-                } else {
-                    // Request may have ended/cancelled - log at debug level only
-                    debug!(
-                        "Progress notification dropped for request '{}' (no subscriber)",
-                        req_id
                     );
                 }
             } else {
@@ -173,8 +213,35 @@ mod tests {
     use super::*;
 
     fn create_test_handler() -> ProgressEnabledHandler {
-        let current_request_id = Arc::new(RwLock::new(None));
-        ProgressEnabledHandler::new(current_request_id)
+        ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), "test/0")
+    }
+
+    fn call(request_id: &str) -> CallContext {
+        CallContext {
+            request_id: request_id.to_string(),
+            agent: aura_events::AgentContext::single_agent(),
+        }
+    }
+
+    /// A `product/version` token lands as separate name and version fields.
+    #[test]
+    fn handshake_info_splits_the_user_agent_into_name_and_version() {
+        let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), "aura/1.2.3");
+        let info = handler.get_info().client_info;
+        assert_eq!(info.name, "aura");
+        assert_eq!(info.version, "1.2.3");
+        assert_eq!(info.website_url.as_deref(), Some(AURA_WEBSITE_URL));
+    }
+
+    /// A bare product name still reports the version that is actually running.
+    #[test]
+    fn handshake_info_falls_back_to_the_crate_version() {
+        for token in ["mezmo-aura", "mezmo-aura/", " mezmo-aura / "] {
+            let handler = ProgressEnabledHandler::new(Arc::new(RwLock::new(None)), token);
+            let info = handler.get_info().client_info;
+            assert_eq!(info.name, "mezmo-aura", "token {token:?}");
+            assert_eq!(info.version, env!("CARGO_PKG_VERSION"), "token {token:?}");
+        }
     }
 
     #[test]
@@ -194,35 +261,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_with_request_id() {
-        let current_request_id = Arc::new(RwLock::new(Some("req_test_123".to_string())));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+        let current_call = Arc::new(RwLock::new(Some(call("req_test_123"))));
+        let handler = ProgressEnabledHandler::new(current_call.clone(), "test/0");
 
         // Verify request ID is accessible
-        let req_id = handler.current_request_id.read().await;
-        assert_eq!(*req_id, Some("req_test_123".to_string()));
+        let guard = handler.current_call.read().await;
+        assert_eq!(
+            guard.as_ref().map(|c| c.request_id.as_str()),
+            Some("req_test_123")
+        );
     }
 
     #[tokio::test]
     async fn test_handler_request_id_changes() {
-        let current_request_id = Arc::new(RwLock::new(None));
-        let handler = ProgressEnabledHandler::new(current_request_id.clone());
+        let current_call = Arc::new(RwLock::new(None));
+        let handler = ProgressEnabledHandler::new(current_call.clone(), "test/0");
 
         // Initially no request ID
         {
-            let req_id = handler.current_request_id.read().await;
-            assert_eq!(*req_id, None);
+            let guard = handler.current_call.read().await;
+            assert!(guard.is_none());
         }
 
         // Set request ID
         {
-            let mut req_id = current_request_id.write().await;
-            *req_id = Some("req_456".to_string());
+            let mut guard = current_call.write().await;
+            *guard = Some(call("req_456"));
         }
 
         // Handler should see the new value
         {
-            let req_id = handler.current_request_id.read().await;
-            assert_eq!(*req_id, Some("req_456".to_string()));
+            let guard = handler.current_call.read().await;
+            assert_eq!(
+                guard.as_ref().map(|c| c.request_id.as_str()),
+                Some("req_456")
+            );
         }
     }
 
